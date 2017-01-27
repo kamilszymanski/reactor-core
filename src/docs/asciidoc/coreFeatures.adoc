@@ -236,5 +236,146 @@ to `publishOn`: they will still switch the execution context for the part of the
 chain after them. Also, only the earliest `subscribeOn` call in the chain is
 actually taken into account.
 
+=== Handling Errors
+TIP: For a quick look at the available operators for error handling, see
+<<which.errors,the relevant operator decision tree>>.
+
+The `Subscriber` interface allow you to deal with errors by mean of the `onError`
+method, and that's probably the first encounter you had with error handling in
+Reactor... But it means that the error, wherever it happened, propagated all the
+way to the final consumer of the data (the user-defined subscriber), and was a
+terminating event in the whole sequence.
+
+Where do errors happen? Under what condition do they get propagated like that?
+And what if you don't want an error to cause the whole sequence to terminate?
+Let's have a deeper look at error handling in Reactor.
+
+==== When do errors get propagated?
+In general, all operators can themselves contain code that potentially trigger
+an exception, or calls a user-defined callback that similarly can fail, so they
+all contain some form of error handling.
+
+As a rule of thumb, an **Unchecked Exception** will always be propagated through
+`onError`. For instance, throwing a `RuntimeException` inside a `map` function
+will translate to an `onError` event:
+
+[source,java]
+----
+Flux.just("foo")
+    .map(s -> { throw new IllegalArgumentException(s); })
+    .subscribe(v -> System.out.println("GOT VALUE"),
+               e -> System.out.println("ERROR: " + e));
+----
+
+This would print out:
+----
+ERROR: java.lang.IllegalArgumentException: foo
+----
+
+Reactor however defines a set of exceptions that are always
+deemed **fatal**footnote:[think `OutOfMemoryError`. Have a look at the `Exceptions.throwIfFatal` method for details]
+, meaning that Reactor cannot keep operating. These are thrown rather than
+propagated.
+
+NOTE: There are also cases where an unchecked exception still cannot be propagated,
+most notably during the subscribe and request phases, due to concurrency races that
+could lead to double onError/onComplete. When these races happen, the error
+that cannot be propagated is "dropped". These cases can still be managed to some
+extent, as the error goes through the `Hooks.onErrorDropped` customizable hook.
+
+You may wonder, what about **Checked Exceptions**?
+
+If, say, you need to call some method that declares it `throws` exceptions, you
+will still have to deal with said exceptions in a `try/catch` block. You have
+several options, though:
+
+ 1. catch the exception and recover from it, the sequence continues normally.
+ 2. catch the exception and wrap it into an _unchecked_ one, then throw it
+    (interrupting the sequence). The `Exceptions` utility class can help you
+    with that (see below).
+ 3. if you're expected to return a `Flux` (eg. you're in a `flatMap`), just wrap
+    the exception into an erroring flux: `return Flux.error(checkedException)`.
+    (the sequence also terminates)
+
+Reactor has an `Exceptions` utility class that you can use, notably to ensure
+that exceptions are wrapped only if they are checked exceptions:
+
+ - use the `Exceptions.propagate` method to wrap exceptions if necessary. It will also call
+   `throwIfFatal` first, and won't wrap `RuntimeException`.
+ - use the `Exceptions.unwrap` method to get the original unwrapped exception (going back to
+   the root cause of a hierarchy of reactor-specific exceptions).
+
+==== Recovering from errors, and masking Exceptions
+Since `onError` is a terminal event for the sequence, you might sometimes wish
+that you could recover from an error and continue doing something, rather than
+let it propagate...
+
+Of course this is possible, and Reactor offers a range of operators that you can
+use to "mask" exceptions that happen in the middle of your reactive chain.
+Let's try to make a parallel with the imperative world to introduce these.
+
+So far, what we've seen is akin to a `try/catch` block:
+[source,java]
+----
+try {
+  String s = doSomethingDangerous();
+  printSuccess(s);
+} catch (Throwable t) {
+  printError();
+}
+----
+
+If `doSomethingDangerous()` throws an exception, it short-circuits to the catch
+block and no value is printed out (just an error message _"onError"_)...
+
+One possible strategy in the catch block is to recover by using a default value:
+[source,java]
+----
+try {
+  String s = doSomethingDangerous();
+  printSuccess(s);
+} catch (Throwable t) {
+  printSuccess("default value");
+}
+----
+
+Another one is to call a fallback method:
+[source,java]
+----
+try {
+  String s = doSomethingDangerous();
+  printSuccess(s);
+} catch (Throwable t) {
+  String s2 = doAlternativeMethod(); <1>
+  printSuccess(s2);
+}
+----
+<1> maybe we need to try/catch this too?
+
+You might also want to just change the exception type, the catch-and-rethrow
+pattern:
+[source,java]
+----
+try {
+  String s = doSomethingDangerous();
+  printSuccess(s);
+} catch (NullPointerException npe) {
+  Throwable t = new MySpecialException("something bad happened", npe);
+  printError(t);
+}
+----
+
+All these strategies have an equivalent in Reactor:
+
+ 1. Use the `onErrorReturn` operator for a default static value (eg. `"default value"`).
+ 2. Use `switchOnError` to switch to a pre-determined fallback sequence (a different `Flux`).
+ 3. Use `onErrorResumeWith` to switch to a different fallback sequence that can
+    dynamically be chosen depending on the original error.
+ 4. Use `Flux.error(new MySpecialException())`, eg. inside a `flatMap`, to sort
+    of "catch and rethrow".
+
+//TODO talk about how the upstream is still terminated (example of an `interval` not ticking anymore)
+//TODO talk about retry, and its caveats (re-subscription, example of an `interval` ticking back from 0)
+
 === Processor
 ==== Do I need a Processor?
